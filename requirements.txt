@@ -1,2 +1,2 @@
-schedule==latest
-pytz==latest
+schedule==1.2.0
+pytz==2025.3
