@@ -5,9 +5,8 @@ on:
     branches: [ main ]
     paths:
       - 'Dockerfile'
-      - 'app.js'
-      - 'package.json'
-  pull_request:
+      - 'app.py
+      pull_request:
     branches: [ main ]
   workflow_dispatch:
 
