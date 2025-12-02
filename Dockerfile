@@ -12,7 +12,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 RUN chmod +x /app/app.py
 
-EXPOSE 3000
+EXPOSE 7860
 
 ENV CUSTOM_DNS="1.1.1.1"
 
