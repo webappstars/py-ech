@@ -1,13 +1,10 @@
 import os
 import asyncio
 from aiohttp import web
-import websockets
 
-# 环境变量
 PORT = int(os.environ.get("PORT", 3000))
 TOKEN = os.environ.get("TOKEN", "ech123456")
 
-# HTTP 处理
 async def http_handler(request):
     if request.path == "/":
         return web.Response(text="Hello-world")
@@ -15,35 +12,26 @@ async def http_handler(request):
         return web.json_response({"status": "running"})
     return web.Response(status=404, text="Not Found")
 
-# WebSocket 处理
-async def ws_handler(websocket, path):
-    if TOKEN and websocket.request_headers.get("Sec-WebSocket-Protocol") != TOKEN:
-        await websocket.close()
-        return
-    try:
-        async for message in websocket:
-            await websocket.send(message)
-    except:
-        pass
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    # 验证 token
+    if TOKEN and request.headers.get("Sec-WebSocket-Protocol") != TOKEN:
+        await ws.close()
+        return ws
+    await ws.prepare(request)
+    async for msg in ws:
+        if msg.type == web.WSMsgType.TEXT:
+            await ws.send_str(msg.data)
+        elif msg.type == web.WSMsgType.BINARY:
+            await ws.send_bytes(msg.data)
+        elif msg.type == web.WSMsgType.ERROR:
+            print('ws connection closed with exception %s' % ws.exception())
+    return ws
 
-async def main():
-    # aiohttp HTTP server
-    app = web.Application()
-    app.router.add_get('/', http_handler)
-    app.router.add_get('/stats', http_handler)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-
-    # WebSocket server
-    ws_server = await websockets.serve(
-        ws_handler, '0.0.0.0', PORT, subprotocols=[TOKEN]
-    )
-
-    print(f"Server running on port {PORT} (HTTP + WS /ech)")
-    await asyncio.Future()  # Keep running
+app = web.Application()
+app.router.add_get('/', http_handler)
+app.router.add_get('/stats', http_handler)
+app.router.add_get('/ech', ws_handler)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(app, host='0.0.0.0', port=PORT)
