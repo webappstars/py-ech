@@ -1,126 +1,117 @@
-#!/usr/bin/env python3
 import os
-import subprocess
-import platform
+import asyncio
 import time
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
-import pytz
-import schedule
+import json
+from http import HTTPStatus
+from urllib.parse import urlparse
+import socket
+import aiohttp
+import websockets
+from websockets import WebSocketServerProtocol
 
-# ---------------- Environment ---------------- #
-PORT = int(os.getenv("PORT", 3000))
-WSPORT = int(os.getenv("WSPORT", PORT + 1))
-TOKEN = os.getenv("TOKEN", "")
-ARGO_AUTH = os.getenv("ARGO_AUTH", "")
-ARGO_DOMAIN = os.getenv("ARGO_DOMAIN", "")
-CUSTOM_DNS = os.getenv("CUSTOM_DNS", "")
-ECH_LOG = os.getenv("ECH_LOG", "ech.log")
-ARGO_LOG = os.getenv("ARGO_LOG", "argo.log")
+# Environment variables
+PORT = int(os.environ.get("PORT", 3000))
+TOKEN = os.environ.get("TOKEN", "ech123456")
+CF_FALLBACK_IPS = os.environ.get("CF_FALLBACK_IPS", "").split(",") if os.environ.get("CF_FALLBACK_IPS") else ["ProxyIP.JP.CMLiussss.net"]
+DOH_SERVERS = [
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/dns-query",
+    "https://1.1.1.1/dns-query"
+]
 
-ECH_BIN = "./ech-server"
-CLOUDFLARED_BIN = "./cloudflared"
+DNS_CACHE = {}
+DNS_CACHE_TTL = 300000  # in milliseconds
 
-# ---------------- Utils ---------------- #
-def detect_arch():
-    arch = platform.machine().lower()
-    if arch in ("x86_64", "amd64"):
-        return ("https://www.baipiao.eu.org/ech/ech-server-linux-amd64",
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64")
-    elif arch in ("i386", "i686"):
-        return ("https://www.baipiao.eu.org/ech/ech-server-linux-386",
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386")
-    elif arch in ("aarch64", "arm64"):
-        return ("https://www.baipiao.eu.org/ech/ech-server-linux-arm64",
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64")
-    else:
-        print(f"❌ Unsupported architecture: {arch}")
-        exit(1)
+# Simple HTTP Handler
+async def http_handler(reader, writer):
+    try:
+        data = await reader.read(1024)
+        if not data:
+            writer.close()
+            await writer.wait_closed()
+            return
 
-def download_binaries():
-    ech_url, cf_url = detect_arch()
-    if not os.path.exists(ECH_BIN):
-        print("🔽 Downloading ech-server binary...")
-        subprocess.run(["curl", "-L", ech_url, "-o", ECH_BIN], check=True)
-    if not os.path.exists(CLOUDFLARED_BIN):
-        print("🔽 Downloading cloudflared binary...")
-        subprocess.run(["curl", "-L", cf_url, "-o", CLOUDFLARED_BIN], check=True)
-    os.chmod(ECH_BIN, 0o755)
-    os.chmod(CLOUDFLARED_BIN, 0o755)
+        request_line = data.decode().splitlines()[0]
+        method, path, _ = request_line.split()
+        
+        # Check WebSocket upgrade
+        if "Upgrade: websocket" in data.decode() and path == "/ech":
+            # Handle WS in a separate coroutine
+            ws_server = await websockets.server.server(ws_handler, PORT, process_request=None, create_protocol=None)
+            await ws_server.wait_closed()
+            return
 
-# ---------------- HTTP Service ---------------- #
-class RequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Hello World!\n")
+        # HTTP response
+        if path == "/":
+            response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello-world"
+        elif path == "/stats":
+            stats = {
+                "dns_cache_size": len(DNS_CACHE),
+                "doh_servers": DOH_SERVERS
+            }
+            response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{json.dumps(stats)}"
         else:
-            self.send_error(404)
+            response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found"
+        writer.write(response.encode())
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+    except Exception as e:
+        print(f"HTTP Error: {e}")
 
-def start_http():
-    server = HTTPServer(("0.0.0.0", PORT), RequestHandler)
-    print(f"🌍 HTTP service running at: http://0.0.0.0:{PORT}")
-    server.serve_forever()
+# DoH resolver
+async def resolve_doh(hostname):
+    now = time.time()
+    if hostname in DNS_CACHE:
+        entry = DNS_CACHE[hostname]
+        if now - entry["timestamp"] < DNS_CACHE_TTL / 1000:
+            print(f"[DoH Cache Hit] {hostname} -> {entry['ip']}")
+            return entry["ip"]
 
-# ---------------- ECH Server ---------------- #
-def start_ech():
-    cmd = [ECH_BIN, "-l", f"ws://0.0.0.0:{WSPORT}"]
-    if TOKEN:
-        cmd += ["-token", TOKEN]
-    if CUSTOM_DNS:
-        cmd += ["--dns", CUSTOM_DNS]
+    print(f"[DoH Query] Resolving {hostname}")
+    async with aiohttp.ClientSession() as session:
+        for server in DOH_SERVERS:
+            try:
+                url = f"{server}?name={hostname}&type=A"
+                async with session.get(url, headers={"Accept": "application/dns-json"}, timeout=5) as resp:
+                    data = await resp.json()
+                    for answer in data.get("Answer", []):
+                        if answer["type"] == 1:
+                            ip = answer["data"]
+                            DNS_CACHE[hostname] = {"ip": ip, "timestamp": now}
+                            print(f"[DoH Success] {hostname} -> {ip} (via {server})")
+                            return ip
+            except Exception as e:
+                print(f"[DoH Failed] {server}: {e}")
 
-    print(f"🔌 Starting ECH WebSocket on port {WSPORT}…")
-    with open(ECH_LOG, "a") as f:
-        subprocess.Popen(cmd, stdout=f, stderr=f)
+    # fallback system DNS
+    try:
+        ip = socket.gethostbyname(hostname)
+        DNS_CACHE[hostname] = {"ip": ip, "timestamp": now}
+        print(f"[DoH Fallback] Using system DNS for {hostname} -> {ip}")
+        return ip
+    except Exception as e:
+        print(f"[DNS Error] Failed to resolve {hostname}: {e}")
+        raise
 
-# ---------------- Cloudflared ---------------- #
-def start_cloudflared():
-    url = f"http://localhost:{WSPORT}"
-    cmd = [CLOUDFLARED_BIN, "tunnel", "--protocol", "http2", "--url", url]
+# WebSocket echo handler
+async def ws_handler(ws: WebSocketServerProtocol, path):
+    if TOKEN and ws.subprotocol != TOKEN:
+        await ws.close()
+        return
+    try:
+        async for message in ws:
+            await ws.send(message)
+    except Exception:
+        pass
 
-    if CUSTOM_DNS:
-        cmd += ["--resolver", CUSTOM_DNS]
-
-    if ARGO_AUTH and ARGO_DOMAIN:
-        cmd += ["run", "--token", ARGO_AUTH]
-        print(f"☁ Using custom domain: {ARGO_DOMAIN}")
-    else:
-        cmd += ["--logfile", ARGO_LOG, "--loglevel", "info"]
-        print("☁ Using temporary Cloudflare tunnel…")
-
-    subprocess.Popen(cmd, stdout=open(os.devnull, "w"), stderr=open(ARGO_LOG, "a"))
-
-# ---------------- Weekly Log Cleanup & Restart ---------------- #
-def weekly_restart():
-    tz = pytz.timezone("Asia/Shanghai")
-    now = datetime.now(tz)
-    print(f"♻ {now} Weekly maintenance: cleaning logs and restarting services…")
-    for f in (ECH_LOG, ARGO_LOG):
-        if os.path.exists(f):
-            os.remove(f)
-    os.execv("/usr/bin/python3", ["python3", "app.py"])
-
-def schedule_task():
-    schedule.every().monday.at("03:00").do(weekly_restart)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-# ---------------- Main ---------------- #
-def main():
-    print("🚀 Starting services…")
-    download_binaries()
-    threading.Thread(target=start_http, daemon=True).start()
-    start_ech()
-    start_cloudflared()
-    threading.Thread(target=schedule_task, daemon=True).start()
-    print("🎉 All services are running successfully!")
-    while True:
-        time.sleep(10)
+# Run single port server
+async def main():
+    print(f"HTTP + WebSocket server running on port {PORT}, token {'enabled' if TOKEN else 'disabled'}")
+    print(f"DoH servers: {DOH_SERVERS}, DNS cache TTL: {DNS_CACHE_TTL/1000}s")
+    server = await asyncio.start_server(http_handler, "0.0.0.0", PORT)
+    async with server:
+        await server.serve_forever()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
