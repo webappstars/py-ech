@@ -2,7 +2,10 @@ FROM python:3.11-slim
 
 ENV TZ=Asia/Shanghai
 
-RUN apt-get update && apt-get install -y curl wget && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y curl wget build-essential libffi-dev libssl-dev && \
+    python3 -m pip install --upgrade pip setuptools wheel && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
