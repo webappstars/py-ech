@@ -7,7 +7,7 @@ TOKEN = os.environ.get("TOKEN", "ech123456")
 # HTTP Handler
 async def http_handler(request):
     if request.path == "/":
-        return web.Response(text="Hello-world")
+        return web.Response(text="Hello world!")
     elif request.path == "/stats":
         return web.json_response({"status": "running"})
     return web.Response(status=404, text="Not Found")
